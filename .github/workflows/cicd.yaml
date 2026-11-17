@@ -1,0 +1,176 @@
+# CI/CD for helloapp: test -> build -> deploy to an ephemeral kind cluster.
+#
+# Why GitHub Actions: the repo lives on GitHub, so Actions needs no extra
+# infrastructure (unlike Jenkins, which needs a server to run and maintain)
+# and integrates with PR checks.
+#
+# Why kind: this task has no long-lived cluster, so every run deploys to a
+# throwaway Kubernetes cluster inside the runner. That exercises the real
+# manifests (rollout, probes, Service routing) on every change for free.
+#
+# Release: on pushes to master and v* tags, the image that passed the scan
+# and the kind deploy is pushed to GHCR. PRs and manual runs never push.
+#
+# Step order differs from a real deployment: a real cluster pulls the image
+# from a registry, so publish comes before deploy. Here the image is loaded
+# straight into kind, so publish can run last and only tested images ship.
+
+name: CICD
+
+# assuming trunk based development
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Image tag: the git tag for releases (v1.2.0 -> helloapp:v1.2.0),
+  # otherwise the commit SHA, so every image maps to an exact commit.
+  IMAGE: helloapp:${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
+
+jobs:
+  test:
+    name: Unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run unit tests
+        run: python -m unittest -v helloapp.test
+
+  build-deploy:
+    name: Build and deploy
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build image
+        run: |
+          docker build \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            -t "$IMAGE" .
+
+      # Reports HIGH findings but only fails on CRITICAL ones (both limited to
+      # findings with a fix available). HIGHs currently come from the
+      # python:3.14-slim base image (Debian packages and the CPython build),
+      # which we don't patch by hand; they clear when the upstream image is
+      # rebuilt. The trade-off: a HIGH in our own dependencies won't block a
+      # merge either, so review the HIGH report in the job log.
+      # Both runs share one cache dir, so the vulnerability DB downloads once.
+      - name: Vulnerability scan
+        run: |
+          trivy() {
+            docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v "${RUNNER_TEMP}/trivy-cache:/root/.cache/trivy" \
+              aquasec/trivy:0.76.2 image --ignore-unfixed --no-progress "$@" "$IMAGE"
+          }
+          echo "::group::HIGH (report only)"
+          trivy --severity HIGH --exit-code 0
+          echo "::endgroup::"
+          trivy --severity CRITICAL --exit-code 1
+
+      - uses: helm/kind-action@v1
+        id: kind
+        with:
+          cluster_name: cicd
+
+      # Side-load the image into the kind nodes, so the cluster never pulls
+      # from a registry: the image is only pushed after it passes the tests.
+      - name: Load image into cluster
+        run: kind load docker-image "$IMAGE" --name cicd
+
+      # Same manifests as any real environment; only the image is overridden.
+      # The edit stays in the runner workspace and is not committed.
+      - name: Apply manifests
+        run: |
+          cd kubernetes
+          kustomize edit set image "helloapp=${IMAGE}"
+          kubectl apply -k .
+
+      - name: Wait for rollout
+        run: kubectl rollout status deployment/helloapp --timeout=120s
+
+      # Calls the app through the Service's cluster DNS name, which checks the
+      # selector, port mapping and readiness together, not just the Pod.
+      - name: Smoke test through Service
+        run: |
+          kubectl run smoke --rm -i --restart=Never \
+            --image=curlimages/curl:8.23.0 -- \
+            sh -c 'curl -fsS --retry 5 --retry-connrefused http://helloapp/ | grep Hello'
+
+      # Only when a cluster exists: if the build or scan failed, there's
+      # nothing to inspect and kubectl would just add confusing errors.
+      - name: Debug info
+        if: failure() && steps.kind.outcome == 'success'
+        run: |
+          kubectl get all -o wide
+          kubectl describe pods -l app.kubernetes.io/name=helloapp
+          kubectl logs -l app.kubernetes.io/name=helloapp --tail=100 --all-containers
+          kubectl get events --sort-by=.lastTimestamp
+
+      # Hand the tested image to the publish job as a file, so it pushes the
+      # exact bytes that were scanned and smoke-tested instead of rebuilding.
+      # Skipped for PRs and manual runs, which never publish.
+      - name: Export image
+        if: github.event_name == 'push'
+        run: docker save -o image.tar "$IMAGE"
+
+      - name: Upload image artifact
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v7
+        with:
+          name: image
+          path: image.tar
+
+  publish:
+    name: Publish image
+    needs: build-deploy
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: image
+
+      # push to master -> ghcr.io/<owner>/<repo>:<commit sha>
+      # push v1.2.0    -> ghcr.io/<owner>/<repo>:v1.2.0
+      # GHCR requires lowercase names; GITHUB_REPOSITORY may contain capitals.
+      - name: Push image to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          docker load -i image.tar
+          remote="ghcr.io/${GITHUB_REPOSITORY,,}:${IMAGE#*:}"
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker tag "$IMAGE" "$remote"
+          docker push "$remote"
+          echo "### 📦 Published \`${remote}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  # Next step (not implemented): roll the published image out to a real cluster.
+  # Preferred: GitOps (Argo CD). Bump the image tag in the environment's
+  # kustomize overlay (in a config repo, or kubernetes/overlays/<env>), either
+  # by a CI commit or automatically with Argo CD Image Updater.
+  # Alternative: push-based, a deploy job running kustomize edit set image +
+  # kubectl apply -k against the target cluster.
